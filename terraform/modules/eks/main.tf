@@ -73,27 +73,11 @@ resource "aws_security_group" "nodes" {
   vpc_id      = var.vpc_id
 
   ingress {
-    from_port = 0
-    to_port   = 0
-    protocol  = "-1"
-    self      = true
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
     description = "Node-to-node communication"
-  }
-
-  ingress {
-    from_port       = 1025
-    to_port         = 65535
-    protocol        = "tcp"
-    security_group_id = aws_security_group.cluster.id
-    description     = "Cluster to nodes"
-  }
-
-  ingress {
-    from_port         = 443
-    to_port           = 443
-    protocol          = "tcp"
-    security_group_id = aws_security_group.cluster.id
-    description       = "Cluster API to nodes"
   }
 
   egress {
@@ -107,6 +91,26 @@ resource "aws_security_group" "nodes" {
     Name                                        = "${var.cluster_name}-nodes-sg"
     "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   })
+}
+
+resource "aws_security_group_rule" "nodes_ingress_cluster_ephemeral" {
+  type                     = "ingress"
+  from_port                = 1025
+  to_port                  = 65535
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.nodes.id
+  source_security_group_id = aws_security_group.cluster.id
+  description              = "Cluster to nodes (ephemeral ports)"
+}
+
+resource "aws_security_group_rule" "nodes_ingress_cluster_443" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.nodes.id
+  source_security_group_id = aws_security_group.cluster.id
+  description              = "Cluster API to nodes"
 }
 
 # ── EKS Cluster ───────────────────────────────────────────────────────────────
