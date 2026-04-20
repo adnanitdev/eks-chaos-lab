@@ -1,0 +1,81 @@
+# user-service: intentionally single replica with no HPA
+# This is a deliberate "weak spot" for the AI chaos engineer to find and flag
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: ecommerce
+  labels:
+    app: user-service
+    tier: backend
+    chaos-risk: "high"   # label for easy filtering
+spec:
+  replicas: 1            # single replica — chaos target
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: ecommerce-app
+      containers:
+      - name: user-service
+        image: hashicorp/http-echo:latest
+        args:
+        - "-text=user-service: OK"
+        - "-listen=:8080"
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: SERVICE_NAME
+          value: "user-service"
+        - name: DB_HOST
+          value: "postgres-user"
+        - name: DB_PORT
+          value: "5432"
+        envFrom:
+        - configMapRef:
+            name: app-config
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: ecommerce
+  labels:
+    app: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP
+# NOTE: No HPA — another intentional weak spot for chaos engineer to find
