@@ -131,8 +131,8 @@ resource "helm_release" "aws_lb_controller" {
 resource "helm_release" "litmus" {
   name             = "litmus"
   repository       = "https://litmuschaos.github.io/litmus-helm/"
-  chart            = "litmus-2-0-0"
-  version          = "3.8.0"
+  chart            = "litmus"
+  version          = "3.28.0"
   namespace        = "litmus"
   create_namespace = true
   timeout          = 300
