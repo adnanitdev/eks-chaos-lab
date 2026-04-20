@@ -76,70 +76,10 @@ resource "helm_release" "prometheus_stack" {
     })
   ]
 
-  depends_on = [module.eks]
+  depends_on = [module.eks, helm_release.aws_lb_controller]
 }
 
-# ── LitmusChaos ───────────────────────────────────────────────────────────────
-
-resource "helm_release" "litmus" {
-  name             = "litmus"
-  repository       = "https://litmuschaos.github.io/litmus-helm/"
-  chart            = "litmus"
-  version          = "3.4.0"
-  namespace        = "litmus"
-  create_namespace = true
-  timeout          = 300
-
-  set {
-    name  = "portal.frontend.service.type"
-    value = "LoadBalancer"
-  }
-
-  depends_on = [module.eks]
-}
-
-# ── Chaos Mesh ────────────────────────────────────────────────────────────────
-
-resource "helm_release" "chaos_mesh" {
-  name             = "chaos-mesh"
-  repository       = "https://charts.chaos-mesh.org"
-  chart            = "chaos-mesh"
-  version          = "2.6.3"
-  namespace        = "chaos-mesh"
-  create_namespace = true
-  timeout          = 300
-
-  set {
-    name  = "dashboard.service.type"
-    value = "LoadBalancer"
-  }
-
-  depends_on = [module.eks]
-}
-
-# ── AWS Load Balancer Controller ──────────────────────────────────────────────
-
-resource "helm_release" "aws_lb_controller" {
-  name             = "aws-load-balancer-controller"
-  repository       = "https://aws.github.io/eks-charts"
-  chart            = "aws-load-balancer-controller"
-  version          = "1.7.2"
-  namespace        = "kube-system"
-  timeout          = 300
-
-  set {
-    name  = "clusterName"
-    value = local.cluster_name
-  }
-  set {
-    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = module.eks.lb_controller_role_arn
-  }
-
-  depends_on = [module.eks]
-}
-
-# ── Metrics Server ────────────────────────────────────────────────────────────
+# ── Metrics Server (deploy early — HPA depends on it) ────────────────────────
 
 resource "helm_release" "metrics_server" {
   name       = "metrics-server"
@@ -150,3 +90,88 @@ resource "helm_release" "metrics_server" {
 
   depends_on = [module.eks]
 }
+
+# ── AWS Load Balancer Controller ──────────────────────────────────────────────
+# Must be fully Ready before any helm release creates a LoadBalancer Service,
+# otherwise the mutating webhook is unavailable and Chaos Mesh / Litmus fail.
+
+resource "helm_release" "aws_lb_controller" {
+  name             = "aws-load-balancer-controller"
+  repository       = "https://aws.github.io/eks-charts"
+  chart            = "aws-load-balancer-controller"
+  version          = "1.7.2"
+  namespace        = "kube-system"
+  timeout          = 300
+
+  # Wait until the controller deployment is fully available before continuing
+  wait          = true
+  wait_for_jobs = true
+
+  set {
+    name  = "clusterName"
+    value = local.cluster_name
+  }
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = module.eks.lb_controller_role_arn
+  }
+  # Ensure the webhook is healthy before marking release complete
+  set {
+    name  = "webhookTLS.auto"
+    value = "true"
+  }
+
+  depends_on = [module.eks, helm_release.metrics_server]
+}
+
+# ── LitmusChaos ───────────────────────────────────────────────────────────────
+# Chart was renamed: the correct chart is "litmus-2-0-0" in the litmuschaos repo.
+# Latest stable: 3.8.0 as of 2024-Q4.
+
+resource "helm_release" "litmus" {
+  name             = "litmus"
+  repository       = "https://litmuschaos.github.io/litmus-helm/"
+  chart            = "litmus-2-0-0"
+  version          = "3.8.0"
+  namespace        = "litmus"
+  create_namespace = true
+  timeout          = 300
+  wait             = true
+
+  set {
+    name  = "portal.frontend.service.type"
+    value = "ClusterIP"   # avoid LB dependency; access via kubectl port-forward
+  }
+
+  depends_on = [module.eks, helm_release.aws_lb_controller]
+}
+
+# ── Chaos Mesh ────────────────────────────────────────────────────────────────
+# Pin to 2.7.0 (2.6.3 had webhook CRD issues on EKS 1.29).
+# Use ClusterIP for dashboard — avoids the LB webhook race condition.
+
+resource "helm_release" "chaos_mesh" {
+  name             = "chaos-mesh"
+  repository       = "https://charts.chaos-mesh.org"
+  chart            = "chaos-mesh"
+  version          = "2.7.0"
+  namespace        = "chaos-mesh"
+  create_namespace = true
+  timeout          = 300
+  wait             = true
+
+  set {
+    name  = "dashboard.service.type"
+    value = "ClusterIP"   # access via: kubectl port-forward svc/chaos-dashboard 2333:2333 -n chaos-mesh
+  }
+  # Ensure CRDs are installed before controller starts
+  set {
+    name  = "controllerManager.enableFilterNamespace"
+    value = "false"
+  }
+
+  depends_on = [module.eks, helm_release.aws_lb_controller]
+}
+
+# ── Prometheus + Grafana (kube-prometheus-stack) ──────────────────────────────
+# Deploy after LB controller so Grafana's LoadBalancer service provisions cleanly.
