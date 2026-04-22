@@ -91,6 +91,25 @@ resource "helm_release" "metrics_server" {
   depends_on = [module.eks]
 }
 
+resource "kubernetes_storage_class_v1" "gp3" {
+  metadata {
+    name = "gp3"
+
+    annotations = {
+      "storageclass.kubernetes.io/is-default-class" = "true"
+    }
+  }
+
+  storage_provisioner = "ebs.csi.aws.com"
+
+  volume_binding_mode = "WaitForFirstConsumer"
+
+  parameters = {
+    type = "gp3"
+  }
+
+  allow_volume_expansion = true
+}
 # ── AWS Load Balancer Controller ──────────────────────────────────────────────
 # Must be fully Ready before any helm release creates a LoadBalancer Service,
 # otherwise the mutating webhook is unavailable and Chaos Mesh / Litmus fail.
