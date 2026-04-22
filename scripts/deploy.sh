@@ -34,12 +34,8 @@ done
 
 # ── Prerequisites check ───────────────────────────────────────────────────────
 step "Checking prerequisites"
-for tool in terraform aws kubectl helm curl; do
-  if command -v "$tool" &>/dev/null; then
-    success "$tool found"
-  else
-    error "$tool not found. Please install it first."
-  fi
+for tool in terraform aws kubectl helm curl python3; do
+  command -v "$tool" &>/dev/null && success "$tool found" || error "$tool not found"
 done
 
 aws sts get-caller-identity --region "$REGION" &>/dev/null || \
@@ -53,16 +49,10 @@ if [ "$DESTROY" = true ]; then
   read -r -p "Type 'yes' to confirm: " confirm
   [ "$confirm" = "yes" ] || { info "Aborted."; exit 0; }
 
-  info "Stopping load generators..."
   kubectl delete pod load-gen load-gen-2 load-gen-3 -n ecommerce --ignore-not-found=true || true
-
-  info "Removing Kubernetes namespaces..."
-  kubectl delete namespace ecommerce --ignore-not-found=true || true
-  kubectl delete namespace litmus --ignore-not-found=true || true
-  kubectl delete namespace chaos-mesh --ignore-not-found=true || true
-  kubectl delete namespace monitoring --ignore-not-found=true || true
-
-  info "Running terraform destroy..."
+  for ns in ecommerce litmus chaos-mesh monitoring; do
+    kubectl delete namespace $ns --ignore-not-found=true || true
+  done
   cd "$ROOT_DIR/terraform"
   terraform destroy -var-file="environments/dev/terraform.tfvars" -auto-approve
   success "Infrastructure destroyed"
@@ -75,19 +65,16 @@ if [ "$SKIP_TERRAFORM" = false ]; then
   cd "$ROOT_DIR/terraform"
   terraform init -upgrade
   terraform plan -var-file="environments/dev/terraform.tfvars" -out=tfplan
-  info "Applying infrastructure (this takes ~15 minutes)..."
+  info "Applying (this takes ~15 minutes)..."
   terraform apply tfplan
   success "EKS cluster provisioned"
 else
-  info "Skipping Terraform (--skip-terraform flag set)"
+  info "Skipping Terraform"
 fi
 
 # ── Configure kubectl ─────────────────────────────────────────────────────────
 step "Configuring kubectl"
 aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
-success "kubectl configured"
-
-info "Waiting for worker nodes to be Ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 NODE_COUNT=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
 success "$NODE_COUNT nodes ready"
@@ -95,38 +82,30 @@ success "$NODE_COUNT nodes ready"
 # ── Deploy Applications ───────────────────────────────────────────────────────
 step "Deploying ecommerce applications"
 
-info "Creating namespace and shared resources..."
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/00-namespace.yaml"
 sleep 3
-
-info "Deploying databases (Redis + PostgreSQL)..."
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/databases.yaml"
-
-info "Deploying microservices..."
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/frontend/deployment.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/api-gateway/deployment.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/user-service/deployment.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/order-service/deployment.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/payment-service/deployment.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/notification-service/deployment.yaml"
-
 kubectl apply -f "$ROOT_DIR/kubernetes/apps/ingress.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/chaos-tools/litmus-rbac.yaml"
 kubectl apply -f "$ROOT_DIR/kubernetes/monitoring/service-monitor.yaml" || \
-  warn "ServiceMonitor apply failed — Prometheus CRDs may not be ready yet."
+  warn "ServiceMonitor failed — re-run after monitoring stack is ready"
 
-# ── Wait for deployments ──────────────────────────────────────────────────────
-step "Waiting for all deployments to be ready"
+step "Waiting for deployments"
 for deploy in frontend api-gateway user-service order-service payment-service notification-service; do
-  info "Waiting for $deploy..."
   kubectl rollout status deployment/"$deploy" -n ecommerce --timeout=180s && \
-    success "$deploy is ready" || warn "$deploy is not ready yet"
+    success "$deploy ready" || warn "$deploy not ready yet"
 done
 
-# ── Patch apps to httpbin (emits real HTTP metrics) ───────────────────────────
-step "Patching services to emit real HTTP metrics"
-# http-echo emits nothing useful to Prometheus
-# httpbin exposes real HTTP endpoints with measurable latency, status codes, delays
+# ── Patch apps to httpbin (real HTTP endpoints) ───────────────────────────────
+step "Patching services to httpbin (real HTTP endpoints)"
+# http-echo returns nothing useful — httpbin exposes /get /delay /status endpoints
+# which produce real CPU/network metrics that Prometheus can measure
 
 for svc in user-service order-service payment-service notification-service; do
   info "Patching $svc → httpbin..."
@@ -139,10 +118,9 @@ for svc in user-service order-service payment-service notification-service; do
   ]'
 done
 
-info "Waiting for patched rollouts..."
 for svc in user-service order-service payment-service notification-service; do
   kubectl rollout status deployment/$svc -n ecommerce --timeout=120s && \
-    success "$svc patched and ready" || warn "$svc rollout pending"
+    success "$svc patched" || warn "$svc rollout pending"
 done
 
 # ── Start load generators ─────────────────────────────────────────────────────
@@ -152,57 +130,44 @@ if [ "$SKIP_TRAFFIC" = false ]; then
   kubectl delete pod load-gen load-gen-2 load-gen-3 -n ecommerce --ignore-not-found=true
   sleep 2
 
-  info "Starting load-gen: steady traffic to api-gateway + frontend..."
+  info "load-gen: steady traffic to api-gateway + frontend..."
   kubectl run load-gen --image=busybox:1.36 --restart=Never -n ecommerce -- \
-    /bin/sh -c "
-      while true; do
-        wget -q -O/dev/null http://api-gateway/get 2>/dev/null
-        wget -q -O/dev/null http://api-gateway/status/200 2>/dev/null
-        wget -q -O/dev/null http://frontend/health 2>/dev/null
-        sleep 0.2
-      done
-    "
+    /bin/sh -c "while true; do
+      wget -q -O/dev/null http://api-gateway/get 2>/dev/null
+      wget -q -O/dev/null http://api-gateway/status/200 2>/dev/null
+      wget -q -O/dev/null http://frontend/health 2>/dev/null
+      sleep 0.2
+    done"
 
-  info "Starting load-gen-2: traffic across all backend services..."
+  info "load-gen-2: traffic to all backend services..."
   kubectl run load-gen-2 --image=busybox:1.36 --restart=Never -n ecommerce -- \
-    /bin/sh -c "
-      while true; do
-        wget -q -O/dev/null http://user-service/get 2>/dev/null
-        wget -q -O/dev/null http://order-service/get 2>/dev/null
-        wget -q -O/dev/null http://payment-service/get 2>/dev/null
-        wget -q -O/dev/null http://notification-service/get 2>/dev/null
-        sleep 0.3
-      done
-    "
+    /bin/sh -c "while true; do
+      wget -q -O/dev/null http://user-service/get 2>/dev/null
+      wget -q -O/dev/null http://order-service/get 2>/dev/null
+      wget -q -O/dev/null http://payment-service/get 2>/dev/null
+      wget -q -O/dev/null http://notification-service/get 2>/dev/null
+      sleep 0.3
+    done"
 
-  info "Starting load-gen-3: mixed traffic including slow endpoints (adds latency signal)..."
+  info "load-gen-3: mixed traffic with slow endpoint (adds latency signal)..."
   kubectl run load-gen-3 --image=busybox:1.36 --restart=Never -n ecommerce -- \
-    /bin/sh -c "
-      while true; do
-        wget -q -O/dev/null http://api-gateway/delay/1 2>/dev/null
-        wget -q -O/dev/null http://payment-service/get 2>/dev/null
-        wget -q -O/dev/null http://user-service/get 2>/dev/null
-        sleep 0.5
-      done
-    "
+    /bin/sh -c "while true; do
+      wget -q -O/dev/null http://api-gateway/delay/1 2>/dev/null
+      wget -q -O/dev/null http://payment-service/get 2>/dev/null
+      wget -q -O/dev/null http://user-service/get 2>/dev/null
+      sleep 0.5
+    done"
 
   success "3 load generators running"
-
-  info "Waiting 90s for Prometheus to collect initial metrics baseline..."
-  for i in $(seq 1 9); do
-    sleep 10
-    echo -ne "  ${CYAN}[${i}0s / 90s]${NC}\r"
-  done
+  info "Waiting 90s for Prometheus to collect baseline metrics..."
+  for i in $(seq 1 9); do sleep 10; echo -ne "  ${CYAN}[${i}0s/90s]${NC}\r"; done
   echo ""
-  success "Baseline metric collection complete"
-else
-  info "Skipping traffic generation (--skip-traffic flag set)"
+  success "Baseline collection complete"
 fi
 
-# ── Verify Prometheus metrics ─────────────────────────────────────────────────
+# ── Verify Prometheus ─────────────────────────────────────────────────────────
 step "Verifying Prometheus metric collection"
 
-info "Starting Prometheus port-forward on port $PROM_PORT..."
 pkill -f "port-forward.*$PROM_PORT" 2>/dev/null || true
 sleep 1
 kubectl port-forward svc/prometheus-operated "$PROM_PORT:9090" -n monitoring &>/dev/null &
@@ -211,28 +176,14 @@ sleep 5
 
 PROM_URL="http://localhost:$PROM_PORT"
 PROM_OK=false
-
-if curl -sf "$PROM_URL/-/healthy" &>/dev/null; then
-  success "Prometheus is healthy"
-  PROM_OK=true
-else
-  warn "Prometheus not responding — skipping metric checks"
-  kill $PF_PID 2>/dev/null || true
-fi
+curl -sf "$PROM_URL/-/healthy" &>/dev/null && PROM_OK=true && success "Prometheus healthy" || \
+  warn "Prometheus not responding — skipping checks"
 
 if [ "$PROM_OK" = true ]; then
-
-  # Query helper — returns series count
   prom_count() {
     curl -sf "$PROM_URL/api/v1/query" --data-urlencode "query=$1" 2>/dev/null | \
-      python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print(len(d.get('data',{}).get('result',[])))
-" 2>/dev/null || echo "0"
+      python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',{}).get('result',[])))" 2>/dev/null || echo "0"
   }
-
-  # Query helper — returns scalar value
   prom_val() {
     curl -sf "$PROM_URL/api/v1/query" --data-urlencode "query=$1" 2>/dev/null | \
       python3 -c "
@@ -244,85 +195,46 @@ print(round(float(r[0]['value'][1]),2) if r else 'no data')
   }
 
   echo ""
-  echo -e "  ${BLUE}Metric check${NC}                                    ${BLUE}Result${NC}"
-  echo    "  ─────────────────────────────────────────────────────────"
-
-  # Core kube-state-metrics
   N=$(prom_count 'kube_pod_info{namespace="ecommerce"}')
-  [ "$N" -gt 0 ] 2>/dev/null && \
-    success "kube_pod_info                              $N pods tracked" || \
-    warn    "kube_pod_info                              no data"
+  [ "$N" -gt 0 ] 2>/dev/null && success "kube_pod_info                  $N pods tracked" || warn "kube_pod_info                  no data"
 
   N=$(prom_count 'kube_pod_container_status_restarts_total{namespace="ecommerce"}')
-  [ "$N" -gt 0 ] 2>/dev/null && \
-    success "pod_restart_counter                        $N series" || \
-    warn    "pod_restart_counter                        no data"
+  [ "$N" -gt 0 ] 2>/dev/null && success "pod_restart_counter            $N series" || warn "pod_restart_counter            no data"
 
   N=$(prom_count 'kube_deployment_status_replicas_available{namespace="ecommerce"}')
-  [ "$N" -gt 0 ] 2>/dev/null && \
-    success "deployment_replicas_available              $N deployments" || \
-    warn    "deployment_replicas_available              no data"
+  [ "$N" -gt 0 ] 2>/dev/null && success "deployment_replicas_available  $N deployments" || warn "deployment_replicas_available  no data"
 
-  # cAdvisor metrics (CPU + memory)
   N=$(prom_count 'container_cpu_usage_seconds_total{namespace="ecommerce",container!=""}')
-  [ "$N" -gt 0 ] 2>/dev/null && \
-    success "container_cpu_usage                        $N series" || \
-    warn    "container_cpu_usage                        no data (cAdvisor may need more time)"
+  [ "$N" -gt 0 ] 2>/dev/null && success "container_cpu_usage            $N series" || warn "container_cpu_usage            no data"
 
   N=$(prom_count 'container_memory_working_set_bytes{namespace="ecommerce",container!=""}')
-  [ "$N" -gt 0 ] 2>/dev/null && \
-    success "container_memory_working_set               $N series" || \
-    warn    "container_memory_working_set               no data"
+  [ "$N" -gt 0 ] 2>/dev/null && success "container_memory               $N series" || warn "container_memory               no data"
 
-  # Network traffic (confirms load generators are actually sending)
-  if [ "$SKIP_TRAFFIC" = false ]; then
-    RATE=$(prom_val 'sum(rate(container_network_transmit_bytes_total{namespace="ecommerce"}[2m]))')
-    if [ "$RATE" != "no data" ] && [ "$RATE" != "0" ] 2>/dev/null; then
-      success "network_transmit_rate                      ${RATE} bytes/s ✓ traffic flowing"
-    else
-      warn    "network_transmit_rate                      no data (load gen may still warming up)"
-    fi
-  fi
+  N=$(prom_count 'container_network_transmit_bytes_total{namespace="ecommerce"}')
+  [ "$N" -gt 0 ] 2>/dev/null && success "container_network_transmit     $N series" || warn "container_network_transmit     no data"
 
-  # Per-service replica status from Prometheus
   echo ""
-  echo -e "  ${BLUE}Service replicas (via Prometheus):${NC}"
+  echo -e "  ${BLUE}Replica health per service:${NC}"
   for svc in frontend api-gateway user-service order-service payment-service notification-service; do
     AVAIL=$(prom_val "kube_deployment_status_replicas_available{namespace=\"ecommerce\",deployment=\"$svc\"}")
     DESIRED=$(prom_val "kube_deployment_spec_replicas{namespace=\"ecommerce\",deployment=\"$svc\"}")
     if [ "$AVAIL" = "no data" ]; then
       warn "  $svc → not in Prometheus yet"
+    elif [ "$AVAIL" = "$DESIRED" ] 2>/dev/null; then
+      echo -e "  ${GREEN}✓${NC} $svc → ${AVAIL}/${DESIRED} replicas"
     else
-      if [ "$AVAIL" = "$DESIRED" ] 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} $svc → ${AVAIL}/${DESIRED} replicas"
-      else
-        echo -e "  ${YELLOW}~${NC} $svc → ${AVAIL}/${DESIRED} replicas (degraded)"
-      fi
+      echo -e "  ${YELLOW}~${NC} $svc → ${AVAIL}/${DESIRED} replicas (degraded)"
     fi
   done
-
-  # Scrape target health
-  echo ""
-  TARGET_SUMMARY=$(curl -sf "$PROM_URL/api/v1/targets" 2>/dev/null | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-active=d.get('data',{}).get('activeTargets',[])
-up=[t for t in active if t.get('health')=='up']
-down=[t for t in active if t.get('health')!='up']
-print(f'{len(up)} up, {len(down)} down out of {len(active)} total targets')
-" 2>/dev/null || echo "unknown")
-  info "Prometheus scrape targets: $TARGET_SUMMARY"
 
   kill $PF_PID 2>/dev/null || true
 fi
 
 # ── HTTP smoke test ───────────────────────────────────────────────────────────
-step "HTTP smoke test — calling each service directly"
+step "HTTP smoke test"
 
-# Use a temporary curl pod for clean HTTP tests
 kubectl delete pod curl-test -n ecommerce --ignore-not-found=true &>/dev/null || true
-kubectl run curl-test --image=curlimages/curl:latest --restart=Never -n ecommerce \
-  -- sleep 120 &>/dev/null || true
+kubectl run curl-test --image=curlimages/curl:latest --restart=Never -n ecommerce -- sleep 120 &>/dev/null || true
 sleep 8
 
 for entry in "api-gateway:80:/get" "user-service:80:/get" "order-service:80:/get" \
@@ -332,11 +244,7 @@ for entry in "api-gateway:80:/get" "user-service:80:/get" "order-service:80:/get
   PATH_=$(echo "$entry" | cut -d: -f3)
   CODE=$(kubectl exec curl-test -n ecommerce -- \
     curl -s -o /dev/null -w "%{http_code}" "http://${SVC}:${PORT}${PATH_}" 2>/dev/null || echo "000")
-  if [[ "$CODE" =~ ^[23] ]]; then
-    success "$SVC${PATH_} → HTTP $CODE"
-  else
-    warn "$SVC${PATH_} → HTTP $CODE"
-  fi
+  [[ "$CODE" =~ ^[23] ]] && success "$SVC → HTTP $CODE" || warn "$SVC → HTTP $CODE"
 done
 
 kubectl delete pod curl-test -n ecommerce --ignore-not-found=true &>/dev/null || true
