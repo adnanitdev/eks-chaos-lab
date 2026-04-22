@@ -197,7 +197,7 @@ resource "aws_eks_node_group" "main" {
   subnet_ids      = var.private_subnet_ids
 
   instance_types = [var.node_instance_type]
-  ami_type       = "AL2_x86_64"
+  ami_type       = "AL2023_x86_64_STANDARD"
   capacity_type  = "ON_DEMAND"
   disk_size      = 20
 
@@ -237,7 +237,6 @@ resource "aws_eks_node_group" "main" {
 resource "aws_eks_addon" "vpc_cni" {
   cluster_name             = aws_eks_cluster.this.name
   addon_name               = "vpc-cni"
-  addon_version            = "v1.16.4-eksbuild.2"
   resolve_conflicts_on_update = "OVERWRITE"
   depends_on               = [aws_eks_node_group.main]
 }
@@ -245,7 +244,6 @@ resource "aws_eks_addon" "vpc_cni" {
 resource "aws_eks_addon" "coredns" {
   cluster_name             = aws_eks_cluster.this.name
   addon_name               = "coredns"
-  addon_version            = "v1.11.1-eksbuild.4"
   resolve_conflicts_on_update = "OVERWRITE"
   depends_on               = [aws_eks_node_group.main]
 }
@@ -253,7 +251,6 @@ resource "aws_eks_addon" "coredns" {
 resource "aws_eks_addon" "kube_proxy" {
   cluster_name             = aws_eks_cluster.this.name
   addon_name               = "kube-proxy"
-  addon_version            = "v1.29.1-eksbuild.2"
   resolve_conflicts_on_update = "OVERWRITE"
   depends_on               = [aws_eks_node_group.main]
 }
@@ -261,7 +258,6 @@ resource "aws_eks_addon" "kube_proxy" {
 resource "aws_eks_addon" "ebs_csi" {
   cluster_name             = aws_eks_cluster.this.name
   addon_name               = "aws-ebs-csi-driver"
-  addon_version            = "v1.29.1-eksbuild.1"
   resolve_conflicts_on_update = "OVERWRITE"
   service_account_role_arn = aws_iam_role.ebs_csi.arn
   depends_on               = [aws_eks_node_group.main]
