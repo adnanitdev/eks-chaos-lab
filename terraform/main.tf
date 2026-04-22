@@ -99,7 +99,6 @@ resource "helm_release" "aws_lb_controller" {
   name             = "aws-load-balancer-controller"
   repository       = "https://aws.github.io/eks-charts"
   chart            = "aws-load-balancer-controller"
-  version          = "1.7.2"
   namespace        = "kube-system"
   timeout          = 300
 
@@ -119,6 +118,11 @@ resource "helm_release" "aws_lb_controller" {
   set {
     name  = "webhookTLS.auto"
     value = "true"
+  }
+
+  set {
+    name  = "vpcId"
+    value = module.vpc.vpc_id
   }
 
   depends_on = [module.eks, helm_release.metrics_server]
