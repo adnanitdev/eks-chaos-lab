@@ -9,7 +9,7 @@ Terraform + Kubernetes manifests for spinning up a production-like EKS cluster w
 ### Infrastructure (Terraform)
 | Resource | Detail |
 |---|---|
-| EKS Cluster | Kubernetes 1.29, us-east-1 |
+| EKS Cluster | Kubernetes 1.34, us-east-1 |
 | VPC | 3 AZs, public + private subnets, NAT gateways |
 | Node Group | 2× t3.medium (auto-scales to 4) |
 | EKS Add-ons | vpc-cni, coredns, kube-proxy, ebs-csi-driver |
